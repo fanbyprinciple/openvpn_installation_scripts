@@ -1,0 +1,110 @@
+#!/bin/bash
+
+# Check if the script is being run as root
+if [[ $EUID -ne 0 ]]; then
+   echo "This script must be run as root"
+   exit 1
+fi
+
+# Get server's public IP address
+PUBLIC_IP=$(curl -s ifconfig.co)
+
+# Install OpenVPN
+if [[ -f /etc/debian_version ]]; then
+  apt-get update
+  apt-get install -y openvpn
+elif [[ -f /etc/redhat-release ]]; then
+  yum install -y epel-release
+  yum install -y openvpn
+fi
+
+# Download and extract easy-rsa
+echo "Downloading and extracting easy-rsa..."
+wget -O /tmp/easy-rsa.tar.gz https://github.com/OpenVPN/easy-rsa/releases/download/v3.0.8/EasyRSA-3.0.8.tgz
+mkdir /etc/openvpn/easy-rsa/
+tar xzf /tmp/easy-rsa.tar.gz --strip-components=1 -C /etc/openvpn/easy-rsa/
+
+# Create CA
+echo "Creating CA..."
+cd /etc/openvpn/easy-rsa/
+./easyrsa init-pki
+./easyrsa build-ca nopass
+cp /etc/openvpn/easy-rsa/pki/ca.crt /etc/openvpn/
+
+# Create server key and certificate
+echo "Creating server key and certificate..."
+./easyrsa gen-req server nopass
+./easyrsa sign-req server server
+cp /etc/openvpn/easy-rsa/pki/private/server.key /etc/openvpn/
+cp /etc/openvpn/easy-rsa/pki/issued/server.crt /etc/openvpn/
+cp /etc/openvpn/easy-rsa/pki/ca.crt /etc/openvpn/
+openssl dhparam -out /etc/openvpn/dh.pem 2048
+
+# Create client key and certificate
+echo "Creating client key and certificate..."
+read -p "Enter a name for the client key: " CLIENT_NAME
+cd /etc/openvpn/easy-rsa/
+./easyrsa gen-req $CLIENT_NAME nopass
+./easyrsa sign-req client $CLIENT_NAME
+
+# Copy the configuration files
+echo "Copying configuration files..."
+cp /usr/share/doc/openvpn/examples/sample-config-files/server.conf /etc/openvpn/
+gunzip -c /usr/share/doc/openvpn/examples/sample-config-files/client.conf.gz > /etc/openvpn/client.conf
+sed -i "s|remote my-server-1 1194|remote $PUBLIC_IP 1194|" /etc/openvpn/client.conf
+sed -i "s|;user nobody|user nobody|" /etc/openvpn/server.conf
+sed -i "s|;group nobody|group nogroup|" /etc/openvpn/server.conf
+sed -i 's|dh dh2048.pem|dh dh.pem|' /etc/openvpn/server.conf
+sed -i 's|ca ca.crt|ca /etc/openvpn/ca.crt|' /etc/openvpn/server.conf
+sed -i 's|cert server.crt|cert /etc/openvpn/server.crt|' /etc/openvpn/server.conf
+sed -i 's|key server.key|key /etc/openvpn/server.key|' /etc/openvpn/server.conf
+sed -i "s|;cipher AES-128-CBC|cipher AES-256-CBC|" /etc/openvpn/server.conf
+sed -i "s|;tls-auth ta.key 0|tls-auth ta.key 0|" /etc/openvpn/server.conf
+sed -i "s|;user nobody|user nobody|" /etc/openvpn/server.conf
+sed -i "s|;group nogroup|group nogroup|" /etc/openvpn/server.conf
+echo "push \"redirect-gateway def1 bypass-dhcp\""
+
+
+# Configure firewall
+echo "Configuring firewall..."
+if [[ -f /etc/debian_version ]]; then
+  # For Debian based systems
+  ufw allow 1194/udp
+  sed -i 's|DEFAULT_FORWARD_POLICY="DROP"|DEFAULT_FORWARD_POLICY="ACCEPT"|' /etc/default/ufw
+  sed -i 's|COMMIT|# COMMIT|' /etc/ufw/after.rules
+  echo "*nat" >> /etc/ufw/after.rules
+  echo ":POSTROUTING ACCEPT [0:0]" >> /etc/ufw/after.rules
+  echo "-A POSTROUTING -s 10.8.0.0/8 -o eth0 -j MASQUERADE" >> /etc/ufw/after.rules
+  echo "COMMIT" >> /etc/ufw/after.rules
+  ufw allow OpenSSH
+  ufw enable
+elif [[ -f /etc/redhat-release ]]; then
+  # For Red Hat based systems
+  firewall-cmd --add-service openvpn
+  firewall-cmd --permanent --add-service openvpn
+  firewall-cmd --add-masquerade
+  firewall-cmd --permanent --add-masquerade
+  firewall-cmd --reload
+fi
+
+# Harden firewall
+echo "Hardening firewall..."
+if [[ -f /etc/debian_version ]]; then
+  sed -i 's|net.ipv4.ip_forward=1|# net.ipv4.ip_forward=1|' /etc/sysctl.conf
+  echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+  sysctl -p
+elif [[ -f /etc/redhat-release ]]; then
+  sed -i 's|net.ipv4.ip_forward = 0|net.ipv4.ip_forward = 1|' /etc/sysctl.conf
+  echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+  sysctl -p
+fi
+
+# Restart OpenVPN
+echo "Restarting OpenVPN..."
+systemctl restart openvpn
+
+echo "Your OpenVPN server is now ready for use!"
+
+
+
+
